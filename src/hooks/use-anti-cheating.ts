@@ -60,10 +60,7 @@ export function useAntiCheating(options: AntiCheatingOptions = {}) {
     onCheatingDetected?.(type);
 
     if (autoSubmitOnCheat && onAutoSubmit && type === 'screenshot') {
-      const delay = getCheatingDelay();
-      setTimeout(() => {
-        onAutoSubmit();
-      }, delay);
+      onAutoSubmit();
     }
   }, [onCheatingDetected, onAutoSubmit, autoSubmitOnCheat, quizId, timeLeft, getCheatingDelay]);
 
@@ -155,10 +152,7 @@ export function useAntiCheating(options: AntiCheatingOptions = {}) {
         showWarning(`${TAB_SWITCH_WARNING_LIMIT}/${TAB_SWITCH_WARNING_LIMIT}: Repeated tab/app switching detected. Your quiz will now be auto-submitted.`);
         if (autoSubmitOnCheat && onAutoSubmit && !autoSubmittedRef.current) {
           autoSubmittedRef.current = true;
-          const delay = getCheatingDelay();
-          setTimeout(() => {
-            onAutoSubmit();
-          }, delay);
+          onAutoSubmit();
         }
         return;
       }
@@ -185,6 +179,10 @@ export function useAntiCheating(options: AntiCheatingOptions = {}) {
         e.preventDefault();
         e.stopPropagation();
         reportCheating('screenshot');
+        if (autoSubmitOnCheat && onAutoSubmit) {
+          onAutoSubmit();
+          return;
+        }
         showWarning("Screenshots are not allowed. Taking screenshots of quiz content is prohibited.");
         return;
       }
@@ -193,6 +191,10 @@ export function useAntiCheating(options: AntiCheatingOptions = {}) {
         e.preventDefault();
         e.stopPropagation();
         reportCheating('screenshot');
+        if (autoSubmitOnCheat && onAutoSubmit) {
+          onAutoSubmit();
+          return;
+        }
         showWarning("Screenshots are not allowed. Alt+Print Screen is disabled during the quiz.");
         return;
       }
@@ -201,6 +203,10 @@ export function useAntiCheating(options: AntiCheatingOptions = {}) {
         e.preventDefault();
         e.stopPropagation();
         reportCheating('screenshot');
+        if (autoSubmitOnCheat && onAutoSubmit) {
+          onAutoSubmit();
+          return;
+        }
         showWarning("Screenshots are not allowed. Snip & Sketch tool is disabled during the quiz.");
         return;
       }
@@ -209,6 +215,10 @@ export function useAntiCheating(options: AntiCheatingOptions = {}) {
         e.preventDefault();
         e.stopPropagation();
         reportCheating('screenshot');
+        if (autoSubmitOnCheat && onAutoSubmit) {
+          onAutoSubmit();
+          return;
+        }
         showWarning("Screenshots are not allowed. Saving screenshots is prohibited during the quiz.");
         return;
       }
