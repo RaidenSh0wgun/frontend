@@ -1,0 +1,557 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { useQuery, useMutation } from "@tanstack/react-query";
+import {
+  fetchQuizDetail,
+  fetchQuizQuestions,
+  fetchQuizAttempts,
+  fetchQuizTimer,
+  logQuizActivity,
+  submitQuizAnswers,
+  type Question,
+} from "@/services/api";
+import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+import { useAntiCheating } from "@/hooks/use-anti-cheating";
+
+function timerStorageKey(quizId: number) {
+  return `quiz_timer_remaining_${quizId}`;
+}
+
+function timerStartKey(quizId: number) {
+  return `quiz_timer_start_${quizId}`;
+}
+
+function formatTime(seconds: number) {
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
+}
+
+function shouldRenderAsTextAnswer(q: Question): boolean {
+  const raw = q as any;
+  const hasChoices = Array.isArray(raw.choices) && raw.choices.length > 0;
+  return !hasChoices;
+}
+
+function shouldRenderAsMultipleChoice(q: Question): boolean {
+  const raw = q as any;
+  const choices = Array.isArray(raw.choices) ? raw.choices : [];
+  return choices.length >= 2;
+}
+
+function parseExpectedTextAnswers(q: Question): string[] {
+  const raw = ((q as any).correct_text || "")
+    .split("\n")
+    .map((v: string) => v.trim())
+    .filter(Boolean);
+  return raw;
+}
+
+function parseSubmittedTextAnswers(value: number | string | undefined, count: number): string[] {
+  const base = typeof value === "string" ? value.split("\n") : [];
+  const normalized = Array.from({ length: Math.max(1, count) }, (_, idx) => (base[idx] || ""));
+  return normalized;
+}
+
+function isQuestionCorrect(
+  q: any,
+  answer: number | string | undefined,
+  qType: string
+): boolean | null {
+  if (answer === undefined || answer === "") return null;
+
+  if (qType === "identification" || qType === "enumeration") {
+    const correctText = (q?.correct_text || "").trim();
+    if (!correctText) return null;
+
+    if (qType === "enumeration") {
+      const correctAnswers = correctText.split("\n").map((s: string) => s.trim().toLowerCase()).filter(Boolean);
+      const submittedAnswers = typeof answer === "string"
+        ? answer.split("\n").map((s: string) => s.trim().toLowerCase()).filter(Boolean)
+        : [];
+      if (correctAnswers.length === 0) return null;
+      const matchCount = submittedAnswers.filter((a: string) => correctAnswers.includes(a)).length;
+      return matchCount === correctAnswers.length;
+    } else {
+      return typeof answer === "string" && answer.trim().toLowerCase() === correctText.toLowerCase();
+    }
+  }
+
+  if (qType === "mcq" || qType === "tf") {
+    try {
+      const choices = Array.isArray(q?.choices) ? q.choices : [];
+      const selectedChoice = choices.find((c: any) => Number(c?.id) === Number(answer));
+      return selectedChoice?.is_correct ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+export default function QuizPage() {
+  const { quizId } = useParams<{ quizId: string }>();
+  const navigate = useNavigate();
+
+  const numericId = Number(quizId);
+  const [searchParams] = useSearchParams();
+  const viewAttempt = searchParams.get("viewAttempt") === "true";
+
+  const { data: quiz, isLoading, error } = useQuery({
+    queryKey: ["quiz", numericId],
+    queryFn: () => fetchQuizDetail(numericId),
+    enabled: Number.isFinite(numericId),
+  });
+
+  const { data: fallbackQuestions } = useQuery({
+    queryKey: ["quiz-questions", numericId],
+    queryFn: () => fetchQuizQuestions(numericId),
+    enabled: Number.isFinite(numericId),
+  });
+
+  const showAttempt = viewAttempt || (quiz?.has_attempted ?? false);
+  const questions: Question[] = quiz?.questions?.length ? quiz.questions : (fallbackQuestions ?? []);
+
+  const { data: attempts } = useQuery({
+    queryKey: ["quiz-attempts", numericId],
+    queryFn: () => fetchQuizAttempts(numericId),
+    enabled: Number.isFinite(numericId) && showAttempt,
+  });
+
+  const [answers, setAnswers] = useState<Record<number, number | string>>({});
+  const [timeLeft, setTimeLeft] = useState<number | null>(null);
+  const [submittedScore, setSubmittedScore] = useState<number | null>(null);
+  const [clientScore, setClientScore] = useState<number | null>(null);
+  const [hasAutoSubmitted, setHasAutoSubmitted] = useState(false);
+  const [antiCheatMessage, setAntiCheatMessage] = useState<string | null>(null);
+  const forcedSubmitRef = useRef(false);
+  const startTimeRef = useRef<number | null>(null);
+
+  const durationSeconds = useMemo(
+    () => (quiz?.duration_minutes ? quiz.duration_minutes * 60 : null),
+    [quiz]
+  );
+
+  const { data: timerData } = useQuery({
+    queryKey: ["quiz-timer", numericId],
+    queryFn: () => fetchQuizTimer(numericId),
+    enabled: Number.isFinite(numericId) && !showAttempt && !isLoading,
+  });
+
+  const submitMutation = useMutation({
+    mutationFn: () => submitQuizAnswers(numericId, answers),
+    onSuccess: (data) => {
+      forcedSubmitRef.current = false;
+      const serverScore = typeof data?.score === "number" ? data.score : null;
+      setSubmittedScore(serverScore);
+
+      if (serverScore === null && quiz) {
+        let correct = 0;
+        questions.forEach((q) => {
+          const userAns = answers[q.id];
+          if (shouldRenderAsTextAnswer(q) && typeof userAns === "string") {
+            const correctAns = (q as any).correct_text || "";
+            if (userAns.trim().toLowerCase() === correctAns.toString().trim().toLowerCase()) {
+              correct++;
+            }
+          }
+        });
+        setClientScore(correct);
+      }
+
+      localStorage.removeItem(timerStorageKey(numericId));
+      localStorage.removeItem(timerStartKey(numericId));
+
+      navigate(`/quiz/${numericId}?viewAttempt=true`, { replace: true });
+    },
+    onError: (error: unknown) => {
+      const errorMessage =
+        error instanceof Error && error.message
+          ? error.message
+          : "Failed to submit quiz. Please try again.";
+      if (forcedSubmitRef.current || hasAutoSubmitted) {
+        setAntiCheatMessage(errorMessage);
+        return;
+      }
+      alert(errorMessage);
+    },
+  });
+
+  useEffect(() => {
+    if (!showAttempt || !attempts?.length) return;
+    const attempt = attempts[0];
+    setSubmittedScore(attempt.score ?? null);
+
+    const normalized: Record<number, number | string> = {};
+    try {
+      const answersObj = attempt.answers;
+      if (answersObj && typeof answersObj === "object") {
+        Object.entries(answersObj).forEach(([k, v]) => {
+          const id = Number(k);
+          if (!Number.isNaN(id)) {
+            normalized[id] = typeof v === "number" || typeof v === "string" ? v : "";
+          }
+        });
+      }
+    } catch (err) {
+      console.error("Error parsing attempt answers:", err);
+    }
+    setAnswers(normalized);
+  }, [showAttempt, attempts]);
+
+  useEffect(() => {
+    if (showAttempt) return;
+    if (timeLeft !== null) return;
+
+    const savedStart = localStorage.getItem(timerStartKey(numericId));
+    if (savedStart) {
+      const start = Number(savedStart);
+      if (Number.isFinite(start) && durationSeconds !== null) {
+        const elapsed = (Date.now() - start) / 1000;
+        const remaining = durationSeconds - elapsed;
+        setTimeLeft(Math.max(0, Math.floor(remaining)));
+        startTimeRef.current = start;
+        return;
+      }
+    }
+
+    if (durationSeconds !== null) {
+      setTimeLeft(durationSeconds);
+      startTimeRef.current = Date.now();
+      localStorage.setItem(timerStartKey(numericId), String(Date.now()));
+    }
+  }, [showAttempt, numericId, durationSeconds]);
+
+  useEffect(() => {
+    if (showAttempt) return;
+    if (timerData && durationSeconds !== null) {
+      setTimeLeft(timerData.remaining_seconds);
+      startTimeRef.current = Date.now() - (durationSeconds - timerData.remaining_seconds) * 1000;
+      localStorage.setItem(timerStartKey(numericId), String(startTimeRef.current));
+    }
+  }, [showAttempt, timerData, durationSeconds, numericId]);
+
+  useEffect(() => {
+    if (showAttempt || !startTimeRef.current || durationSeconds === null) return;
+    const interval = setInterval(() => {
+      const elapsed = (Date.now() - startTimeRef.current!) / 1000;
+      const remaining = durationSeconds - elapsed;
+      setTimeLeft(Math.max(0, Math.floor(remaining)));
+    }, 100);
+    return () => clearInterval(interval);
+  }, [showAttempt, durationSeconds]);
+
+  useEffect(() => {
+    if (showAttempt || timeLeft === null || timeLeft > 0) return;
+    if (!submitMutation.isPending && submittedScore === null && !hasAutoSubmitted) {
+      submitMutation.mutate();
+    }
+  }, [timeLeft, showAttempt, submitMutation, submittedScore, hasAutoSubmitted]);
+
+  useEffect(() => {
+    if (showAttempt) {
+      return;
+    }
+    const handleBeforeUnload = () => {
+      void logQuizActivity(numericId, "page_refresh", { source: "beforeunload" });
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => {
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+    };
+  }, [numericId, showAttempt]);
+
+  const isTimeUp = (timeLeft ?? 0) <= 0;
+  const canEdit = !isTimeUp && submittedScore === null && !showAttempt && !hasAutoSubmitted;
+  const finalScore = submittedScore ?? clientScore;
+  const isLeavingQuiz = showAttempt || submittedScore !== null || submitMutation.isPending;
+
+  useAntiCheating({
+    quizId: numericId,
+    timeLeft,
+    isLeaving: isLeavingQuiz,
+    autoSubmitOnCheat: true,
+    showWarnings: false,
+    onWarning: (message) => setAntiCheatMessage(message),
+    onCheatingDetected: (type) => {
+      const actionMap: Record<"tab_switch" | "copy_paste" | "screenshot", "tab_switch" | "copy_paste" | "screenshot" | "focus_loss"> = {
+        tab_switch: "tab_switch",
+        copy_paste: "copy_paste",
+        screenshot: "screenshot",
+      };
+      void logQuizActivity(numericId, actionMap[type], { timeLeft });
+      if (type === "tab_switch") {
+        void logQuizActivity(numericId, "focus_loss", { timeLeft });
+      }
+    },
+    onAutoSubmit: () => {
+      if (showAttempt || submittedScore !== null || hasAutoSubmitted || submitMutation.isPending) return;
+      forcedSubmitRef.current = true;
+      setTimeLeft(0);
+      setAntiCheatMessage("Cheating detected. Submitting quiz now.");
+      setHasAutoSubmitted(true);
+      submitMutation.mutate();
+    },
+  });
+
+  const questionCorrectness = useMemo(() => {
+    if (!showAttempt || !questions.length) return {};
+    const map: Record<number, boolean | null> = {};
+    questions.forEach((q) => {
+      const qType = (q as any)?.question_type as string;
+      const answer = answers[q.id];
+      map[q.id] = isQuestionCorrect(q, answer, qType);
+    });
+    return map;
+  }, [showAttempt, questions, answers]);
+
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-slate-950 via-purple-950/30 to-slate-950 flex items-center justify-center text-white">
+        Loading quiz...
+      </div>
+    );
+  }
+
+  if (error || !quiz) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-slate-950 via-purple-950/30 to-slate-950 p-8 text-white">
+        <div className="max-w-2xl mx-auto rounded-3xl border border-rose-500/40 bg-slate-900/90 p-8 shadow-xl shadow-black/40">
+          <h1 className="text-3xl font-bold text-rose-300 mb-4">Quiz not available</h1>
+          <p className="text-slate-300 mb-6">
+            This quiz may have been deactivated, removed, or is no longer available.
+          </p>
+          <Button variant="secondary" onClick={() => navigate(-1)}>
+            Back
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!Number.isFinite(numericId)) {
+    return <div className="text-muted-foreground">Invalid quiz</div>;
+  }
+
+  const handleChoice = (qid: number, cid: number) => {
+    if (showAttempt) return;
+    setAnswers((prev) => ({ ...prev, [qid]: cid }));
+    void logQuizActivity(numericId, "answer_change", { questionId: qid, answerType: "choice" });
+  };
+
+  const handleText = (qid: number, text: string) => {
+    if (showAttempt) return;
+    setAnswers((prev) => ({ ...prev, [qid]: text }));
+    void logQuizActivity(numericId, "answer_change", { questionId: qid, answerType: "text" });
+  };
+
+  const handleTextAtIndex = (qid: number, idx: number, text: string, expectedCount: number) => {
+    if (showAttempt) return;
+    setAnswers((prev) => {
+      const current = parseSubmittedTextAnswers(prev[qid], expectedCount);
+      const next = current.map((v, i) => (i === idx ? text : v));
+      return { ...prev, [qid]: next.join("\n") };
+    });
+    void logQuizActivity(numericId, "answer_change", { questionId: qid, answerType: "enumeration", index: idx });
+  }
+
+  return (
+    <div className="min-h-screen bg-background p-4 sm:p-8">
+      <div className="max-w-4xl mx-auto space-y-10">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div>
+            <button
+              onClick={() => quiz?.course && navigate(`/courses/${quiz.course}`)}
+              className="inline-flex items-center gap-2 text-muted-foreground hover:text-amber-600 dark:hover:text-yellow-400 transition-colors mb-3"
+            >
+              ← Back to course
+            </button>
+            <h1 className="text-4xl font-black bg-gradient-to-r from-red-400 via-yellow-400 to-orange-400 bg-clip-text text-transparent">
+              {quiz.title}
+            </h1>
+            {quiz.description && (
+              <p className="text-muted-foreground mt-2">{quiz.description}</p>
+            )}
+          </div>
+
+          {!showAttempt && timeLeft !== null && (
+            <div className="bg-card border border-border rounded-2xl px-8 py-4 text-center">
+              <div className="text-xs text-muted-foreground">Time Remaining</div>
+              <div className={`text-3xl font-bold tabular-nums ${isTimeUp ? "text-red-500" : "text-foreground"}`}>
+                {formatTime(Math.max(timeLeft, 0))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {!showAttempt && antiCheatMessage && (
+          <div className="rounded-2xl border border-amber-500/40 bg-amber-100 dark:bg-amber-400/10 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
+            {antiCheatMessage}
+          </div>
+        )}
+
+        {!showAttempt && (
+          <div className="text-muted-foreground text-sm">
+            {Object.keys(answers).length} of {questions.length} questions answered
+          </div>
+        )}
+
+        {showAttempt && finalScore !== null && (
+          <div className="bg-card border border-border rounded-3xl p-8 shadow-sm">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-6">
+              <div>
+                <h2 className="text-2xl font-bold text-foreground">Your Results</h2>
+                <p className="text-muted-foreground mt-1">{questions.length} questions total</p>
+              </div>
+              <div className="text-right">
+                <div className="text-6xl font-black bg-gradient-to-r from-red-400 via-yellow-400 to-orange-400 bg-clip-text text-transparent">
+                  {finalScore}
+                </div>
+                <p className="text-muted-foreground">out of {questions.length}</p>
+                <p className="text-xl font-medium text-foreground mt-1">
+                  {Math.round((finalScore / questions.length) * 100)}%
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="space-y-8">
+          {questions.map((q, index) => {
+            const answer = answers[q.id];
+            const qType = (q as any).question_type as string;
+            const isTextBased = qType === "identification" || qType === "enumeration";
+            const expectedAnswers = isTextBased ? parseExpectedTextAnswers(q) : [];
+            const expectedCount = qType === "enumeration" ? Math.max(1, expectedAnswers.length) : 1;
+            const isCorrect = questionCorrectness[q.id];
+
+            return (
+              <div
+                key={q.id}
+                className={`bg-card border rounded-3xl p-8 shadow-sm transition-all ${
+                  showAttempt && isCorrect === true
+                    ? "border-emerald-500/50 bg-emerald-950/30"
+                    : showAttempt && isCorrect === false
+                    ? "border-red-500/50 bg-red-950/30"
+                    : "border-border"
+                }`}
+              >
+                <div className="flex items-start justify-between gap-4 mb-6">
+                  <p className="font-semibold text-lg text-foreground">
+                    Question {index + 1}: {q.text}
+                  </p>
+                  {showAttempt && isCorrect !== null && (
+                    <div
+                      className={`px-4 py-1 rounded-full text-sm font-medium ${
+                        isCorrect
+                          ? "bg-emerald-500/20 text-emerald-400"
+                          : "bg-red-500/20 text-red-400"
+                      }`}
+                    >
+                      {isCorrect ? "✓ Correct" : "✗ Incorrect"}
+                    </div>
+                  )}
+                </div>
+
+                {isTextBased ? (
+                  <div className="space-y-4">
+                    {qType === "enumeration" && expectedCount > 1 ? (
+                      parseSubmittedTextAnswers(answer, expectedCount).map((value, idx) => (
+                        <div key={idx}>
+                          <Textarea
+                            value={value}
+                            onChange={(e) => handleTextAtIndex(q.id, idx, e.target.value, expectedCount)}
+                            disabled={!canEdit}
+                            placeholder={`Answer ${idx + 1}`}
+                            className="min-h-[70px] bg-background border-border rounded-2xl text-foreground placeholder:text-muted-foreground caret-foreground focus:border-yellow-500"
+                          />
+                          {showAttempt && expectedAnswers[idx] && (
+                            <p className={`mt-2 text-sm ${isCorrect ? "text-emerald-400" : "text-red-400"}`}>
+                              Expected: {expectedAnswers[idx]}
+                            </p>
+                          )}
+                        </div>
+                      ))
+                    ) : (
+                      <Textarea
+                        value={typeof answer === "string" ? answer : ""}
+                        onChange={(e) => handleText(q.id, e.target.value)}
+                        disabled={!canEdit}
+                        placeholder="Type your answer here..."
+                        className="min-h-[120px] bg-background border-border rounded-2xl text-foreground placeholder:text-muted-foreground caret-foreground focus:border-yellow-500"
+                      />
+                    )}
+                  </div>
+                ) : shouldRenderAsMultipleChoice(q) ? (
+                  <div className="space-y-3">
+                    {(q as any).choices.map((ch: any) => {
+                      const selected = answer === ch.id;
+                      const showFeedback = showAttempt && !canEdit;
+                      let style =
+                        "border border-border bg-background text-foreground hover:border-yellow-500/50";
+
+                      if (showFeedback) {
+                        if (selected) {
+                          style = ch.is_correct
+                            ? "border-emerald-500 bg-emerald-950/50 text-emerald-100"
+                            : "border-red-500 bg-red-950/50 text-red-100";
+                        }
+                      } else if (selected) {
+                        style = "border-yellow-400 bg-yellow-950/30 text-yellow-100";
+                      }
+
+                      return (
+                        <button
+                          key={ch.id}
+                          type="button"
+                          onClick={() => handleChoice(q.id, ch.id)}
+                          disabled={!canEdit}
+                          className={`w-full text-left p-5 rounded-2xl transition-all text-left ${style}`}
+                        >
+                          {ch.text}
+                        </button>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <p className="text-amber-400 bg-amber-950/30 p-4 rounded-2xl">Unsupported question type</p>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="flex flex-col sm:flex-row gap-4 justify-between pt-6">
+          <Button
+            variant="outline"
+            onClick={() => {
+              if (!showAttempt && timeLeft !== null && timeLeft > 0) {
+                if (!confirm("Leave the quiz? The timer will continue.")) return;
+              }
+              if (quiz?.course) {
+                navigate(`/courses/${quiz.course}`);
+              } else {
+                navigate("/");
+              }
+            }}
+            className="rounded-2xl border-border"
+          >
+            {showAttempt ? "Back to Course" : "Leave Quiz"}
+          </Button>
+
+          {canEdit && (
+            <Button
+              onClick={() => submitMutation.mutate()}
+              disabled={submitMutation.isPending}
+              className="bg-gradient-to-r from-red-500 via-yellow-500 to-orange-500 text-white font-bold rounded-2xl px-12 py-6 shadow-xl hover:brightness-110"
+            >
+              {submitMutation.isPending ? "Submitting Quiz..." : "Submit Quiz"}
+            </Button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
